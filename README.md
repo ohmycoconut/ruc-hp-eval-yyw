@@ -1,5 +1,9 @@
 # RUC-OV-Eval: OpenViking 性能评估系统
 
+## 克隆项目
+
+- 使用git clone --recursive克隆子项目
+
 ## 项目结构
 
 ```
@@ -27,6 +31,17 @@ ruc-ov-eval/
 ```bash
 # 使用 uv 安装所有依赖
 uv sync --all-packages
+```
+
+### 创建并激活虚拟环境
+
+```bash
+#创建名为 .venv 的虚拟环境（默认）
+uv venv
+#激活环境（macOS/Linux）
+source .venv/bin/activate
+#激活环境（Windows）
+.venv\Scripts\activate
 ```
 
 ### 2. 配置 OpenViking
