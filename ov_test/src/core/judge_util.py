@@ -5,14 +5,16 @@ import os
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-def locomo_grader(
-    llm_client:ChatOpenAI , model: str, question: str, gold_answer: str, response: str
+def llm_grader(
+    llm_client, model: str, question: str, gold_answer: str, response: str, dataset_name: str = "Locomo"
 ) -> bool:
-    system_prompt = """
+    
+    # 1. 根据 dataset_name 路由选择 Prompt
+    if "Locomo" in dataset_name.lower():
+        system_prompt = """
         You are an expert grader that determines if answers to questions match a gold standard answer
         """
-
-    ACCURACY_PROMPT = f"""
+        ACCURACY_PROMPT = f"""
     Your task is to label an answer to a question as 'CORRECT' or 'WRONG'. You will be given the following data:
         (1) a question (posed by one user to another user),
         (2) a 'gold' (ground truth) answer,
@@ -37,13 +39,40 @@ def locomo_grader(
 
     Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}
     """
+    else:
+        # 通用 Prompt 或其他数据集的 Prompt
+        system_prompt = """
+        You are an expert grader that determines if an AI-generated answer matches the gold standard (ground truth) answer for a given question.
+        """
+        ACCURACY_PROMPT = f"""
+        Your task is to label an answer to a question as 'CORRECT' or 'WRONG'. You will be given:
+            (1) A question
+            (2) A 'gold' (ground truth) answer
+            (3) A generated answer
+
+        Grading rules:
+        - If the generated answer correctly encompasses the core semantic meaning or facts of the gold answer, grade it as CORRECT.
+        - If the generated answer contradicts the gold answer or misses the key factual information, it is WRONG.
+
+        Question: {question}
+        Gold answer: {gold_answer}
+        Generated answer: {response}
+
+        First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG.
+        Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}
+        """
+
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=ACCURACY_PROMPT)
     ]
     resp = llm_client.invoke(messages)
     content = resp.content
-    result = json.loads(content)
-
-    label = result.get("is_correct", result.get("label", "WRONG"))
-    return label.strip().lower() == "correct"
+    
+    try:
+        result = json.loads(content)
+        label = result.get("is_correct", result.get("label", "WRONG"))
+        return label.strip().lower() == "correct"
+    except json.JSONDecodeError:
+        # 容错：防止 LLM 没按格式输出 JSON
+        return "CORRECT" in content.upper()
