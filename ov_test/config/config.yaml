@@ -8,15 +8,17 @@ adapter:
   class_name: "LocomoAdapter"     
 
 execution:
-  max_workers: 5         # LLM 生成任务的并发数
+  max_workers: 12         # LLM 生成任务的并发数
   ingest_workers: 5      # 数据入库任务的并发数，提交到ov的并发数
   retrieval_topk: 5
-  max_queries: 10        # 最大查询数，null表示全部查询
+  max_queries: null        # 最大查询数，null表示全部查询
   skip_ingestion: true  # 是否关闭数据插入
+  eval_task_timeout: 60
 # ==================================  
 
 paths:
-  raw_data: "Data/{dataset_name}/{dataset_name}.json"
+  paths:
+  raw_data: "C:/Users/29352/Desktop/programming/Windows/locomo/LoCoMo/data/locomo10.json"
   doc_output_dir: "Data/{dataset_name}/processed_docs"
   vector_store: "Data/{dataset_name}/viking_store_index"
   output_dir: "Output/{dataset_name}/experiment_1"
@@ -25,6 +27,16 @@ paths:
 
 llm:
   model: "doubao-seed-1-8-251228"
+  timeout: 60
+  max_retries: 2
   temperature: 0
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   api_key: "76aab4eb-95e0-453e-b898-7934260ae6a1"
+
+hipporag2:
+  repo_root: "C:/Users/29352/Desktop/programming/Windows/locomo/Hippo/HippoRAG"
+  save_dir: "hippo_objects"
+  llm_model_name: "doubao-seed-2-0-pro-260215"
+  llm_base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  embedding_model_name: "facebook/contriever"
+  num_to_retrieve: 5

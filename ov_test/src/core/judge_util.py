@@ -1,16 +1,25 @@
-import asyncio
 import json
-import os
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
 
 def llm_grader(
-    llm_client, model: str, question: str, gold_answer: str, response: str, dataset_name: str = "Locomo"
+    llm_client,
+    model: str,
+    question: str,
+    gold_answer: str,
+    response: str,
+    dataset_name: str = "Locomo"
 ) -> bool:
-    
-    # 1. 根据 dataset_name 路由选择 Prompt
-    if "Locomo" in dataset_name.lower():
+    """
+    兼容原 ruc-ov-eval 的 judge 逻辑，但不再依赖 langchain。
+    llm_client 期望支持：
+      - 推荐：llm_client.generate(prompt: str) -> str
+      - 兜底：如果传的是 openai client（OpenAI SDK），也可在这里扩展（当前以 generate 为主）
+
+    返回 bool: True 表示 CORRECT, False 表示 WRONG
+    """
+
+    # 1) 根据 dataset_name 路由选择 Prompt（保持你原逻辑）
+    if "locomo" in (dataset_name or "").lower():
         system_prompt = """
         You are an expert grader that determines if answers to questions match a gold standard answer
         """
@@ -40,7 +49,6 @@ def llm_grader(
     Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}
     """
     else:
-        # 通用 Prompt 或其他数据集的 Prompt
         system_prompt = """
         You are an expert grader that determines if an AI-generated answer matches the gold standard (ground truth) answer for a given question.
         """
@@ -62,17 +70,32 @@ def llm_grader(
         Respond with JSON only: {{"is_correct": "CORRECT" or "WRONG", "reasoning": "your explanation"}}
         """
 
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=ACCURACY_PROMPT)
-    ]
-    resp = llm_client.invoke(messages)
-    content = resp.content
-    
+    # 2) 构造“单字符串 prompt”，替代 langchain messages（行为等价）
+    prompt = (
+        f"{system_prompt.strip()}\n\n"
+        f"{ACCURACY_PROMPT.strip()}\n"
+    )
+
+    # 3) 调用 LLM（优先走你自己的 wrapper：generate）
+    content = None
+    try:
+        if hasattr(llm_client, "generate"):
+            content = llm_client.generate(prompt)
+        else:
+            # 兜底：如果用户传进来的是一个可调用对象
+            content = llm_client(prompt)
+    except Exception as e:
+        # Judge 调用失败，按不正确处理（也可以改成 raise）
+        return False
+
+    if content is None:
+        return False
+
+    # 4) 解析结果：保持你原逻辑
     try:
         result = json.loads(content)
         label = result.get("is_correct", result.get("label", "WRONG"))
-        return label.strip().lower() == "correct"
+        return str(label).strip().lower() == "correct"
     except json.JSONDecodeError:
         # 容错：防止 LLM 没按格式输出 JSON
-        return "CORRECT" in content.upper()
+        return "CORRECT" in str(content).upper()

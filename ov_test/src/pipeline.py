@@ -1,94 +1,82 @@
-# src/pipeline.py
 import os
 import json
 import time
-import random
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 from src.adapters.base import BaseAdapter
 from src.core.logger import get_logger
-from src.core.vector_store import VikingStoreWrapper
 
 from .core.monitor import BenchmarkMonitor
 from .core.metrics import MetricsCalculator
 from .core.judge_util import llm_grader
 
+from concurrent.futures import TimeoutError
+from tqdm import tqdm
+
 class BenchmarkPipeline:
-    def __init__(self, config, adapter: BaseAdapter, vector_db: VikingStoreWrapper, llm):
+    def __init__(self, config, adapter: BaseAdapter, vector_db, llm):
         self.config = config
         self.adapter = adapter
         self.db = vector_db
         self.llm = llm
         self.logger = get_logger()
         self.monitor = BenchmarkMonitor()
-        
-        # 结果文件路径
+
         self.output_dir = self.config['paths']['output_dir']
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
+
         self.generated_file = os.path.join(self.output_dir, "generated_answers.json")
         self.eval_file = os.path.join(self.output_dir, "qa_eval_detailed_results.json")
         self.report_file = os.path.join(self.output_dir, "benchmark_metrics_report.json")
-        
-        # 用于存储各阶段汇总指标
+
         self.metrics_summary = {
-            "insertion": {"time": 0, "input_tokens": 0, "output_tokens": 0},
-            "deletion": {"time": 0, "input_tokens": 0, "output_tokens": 0}
+            "insertion": {},
+            "deletion": {"time": 0, "input_tokens": 0, "output_tokens": 0},
+            "judge": {"time": 0, "input_tokens": 0, "output_tokens": 0},
         }
 
+    # =========================================================
+    # ===================== GENERATION ========================
+    # =========================================================
+
     def run_generation(self):
-        """Step1 数据预处理"""
         self.logger.info(">>> Stage: Ingestion & Generation")
+
         doc_dir = self.config['paths'].get('doc_output_dir')
         if not doc_dir:
             doc_dir = os.path.join(self.output_dir, "docs")
-        # 0. 预处理数据集
-        try:
-            doc_info = self.adapter.data_prepare(doc_dir)
-        except Exception as e:
-            exit(1)
+
+        doc_info = self.adapter.data_prepare(doc_dir)
+
         skip_ingestion = self.config['execution'].get('skip_ingestion', False)
 
         if skip_ingestion:
-            self.logger.info(f"Skipping Ingestion. Using existing docs at: {doc_dir}")
-            if not os.path.exists(doc_dir):
-                 self.logger.warning(f"Warning: Doc directory {doc_dir} not found, but ingestion is skipped.")
-            self.metrics_summary["insertion"] = {"time": 0, "input_tokens": 0, "output_tokens": 0}
-            
-        else:  # 正常执行入库
+            self.logger.info("Skipping Ingestion.")
+        else:
             ingest_workers = self.config['execution'].get('ingest_workers', 10)
-            ingest_stats = self.db.ingest(
-                doc_info, 
-                max_workers=ingest_workers, 
-                monitor=self.monitor
-            )
-            self.metrics_summary["insertion"] = ingest_stats
-            self.logger.info(f"Insertion finished. Time: {ingest_stats['time']:.2f}s")
+            ingest_stats = self.db.ingest(doc_info, max_workers=ingest_workers, monitor=self.monitor)
 
-            # 将 insertion 效率数据写入报告
-            self._update_report({
-                "Insertion Efficiency (Total Dataset)": {
-                    "Total Insertion Time (s)": self.metrics_summary["insertion"]["time"],
-                    "Total Input Tokens": self.metrics_summary["insertion"]["input_tokens"],
-                    "Total Output Tokens": self.metrics_summary["insertion"]["output_tokens"]
-                }
-            })
-        """Step 2 & 3: 数据入库 + 检索生成"""
-        # 1. 始终加载数据
-        samples = self.adapter.load_and_transform()    
-        # 2. 准备 QA 任务
+            # 保留完整 ingest_stats（含 breakdown）
+            self.metrics_summary["insertion"] = ingest_stats
+
+            payload = {
+                "Insertion Efficiency (Total Dataset)": ingest_stats
+            }
+            self._update_report(payload)
+
+        samples = self.adapter.load_and_transform()
         tasks = self._prepare_tasks(samples)
+
         results_map = {}
         max_workers = self.config['execution']['max_workers']
-        
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_task = {
-                executor.submit(self._process_generation_task, task): task 
+                executor.submit(self._process_generation_task, task): task
                 for task in tasks
             }
-            
+
             pbar = tqdm(total=len(tasks), desc="Generating Answers", unit="task")
             for future in as_completed(future_to_task):
                 task = future_to_task[future]
@@ -98,209 +86,279 @@ class BenchmarkPipeline:
                 except Exception as e:
                     self.logger.error(f"Generation failed for task {task['id']}: {e}")
                     self.monitor.worker_end(success=False)
-                pbar.set_postfix(self.monitor.get_status_dict())
                 pbar.update(1)
             pbar.close()
 
-        # 3. 保存中间回答文件
         sorted_results = [results_map[i] for i in sorted(results_map.keys())]
-        dataset_name = self.config.get('dataset_name', 'Unknown_Dataset')
+
         save_data = {
-            "summary": {"dataset": dataset_name, "total_queries": len(sorted_results)},
+            "summary": {
+                "dataset": self.config.get('dataset_name'),
+                "total_queries": len(sorted_results),
+                "insertion_efficiency": self.metrics_summary["insertion"],
+            },
             "results": sorted_results
         }
+
+        # 写平均效率
         total = len(sorted_results)
         if total > 0:
             self._update_report({
-                    "Query Efficiency (Average Per Query)": {
-                        "Average Retrieval Time (s)": sum(r['retrieval']['latency_sec'] for r in sorted_results) / total,
-                        "Average Input Tokens": sum(r['token_usage']['total_input_tokens'] for r in sorted_results) / total,
-                        "Average Output Tokens": sum(r['token_usage']['llm_output_tokens'] for r in sorted_results) / total,
-                    }
+                "Query Efficiency (Average Per Query)": {
+                    "Average Retrieval Time (s)": sum(r['retrieval']['latency_sec'] for r in sorted_results) / total,
+                    "Average Input Tokens (cl100k_base)": sum(r['token_usage']['total_input_tokens'] for r in sorted_results) / total,
+                    "Average Output Tokens (cl100k_base)": sum(r['token_usage']['llm_output_tokens'] for r in sorted_results) / total,
+                    "Average HippoRAG2 Internal Input Tokens (cl100k_base)": sum(r['token_usage'].get('hippo_internal_input_tokens', 0) for r in sorted_results) / total,
+                    "Average HippoRAG2 Internal Output Tokens (cl100k_base)": sum(r['token_usage'].get('hippo_internal_output_tokens', 0) for r in sorted_results) / total,
+                    "Average Generation Prompt Tokens (cl100k_base)": sum(r['token_usage']['generation_usage'].get('cl100k_prompt_tokens', 0) for r in sorted_results) / total,
+                    "Average Generation Completion Tokens (cl100k_base)": sum(r['token_usage']['generation_usage'].get('cl100k_completion_tokens', 0) for r in sorted_results) / total,
                 }
-            )
+            })
+
         with open(self.generated_file, "w", encoding="utf-8") as f:
             json.dump(save_data, f, indent=2, ensure_ascii=False)
 
+    # =========================================================
+    # ==================== PER QUERY TASK =====================
+    # =========================================================
+
+    def _process_generation_task(self, task):
+        self.monitor.worker_start()
+        qa = task['qa']
+
+        # ---------- Retrieval ----------
+        t0 = time.time()
+        search_res = self.db.retrieve(
+            query=qa.question,
+            topk=self.config['execution']['retrieval_topk']
+        )
+        latency = time.time() - t0
+
+        hippo_delta = {}
+        if hasattr(self.db, "get_last_retrieve_delta"):
+            hippo_delta = self.db.get_last_retrieve_delta()
+
+        hippo_internal_in = int(
+            hippo_delta.get("embed_input_tokens", 0)
+            + hippo_delta.get("llm_prompt_tokens", 0)
+        )
+        hippo_internal_out = int(
+            hippo_delta.get("llm_completion_tokens", 0)
+        )
+
+        retrieved_texts = []
+        retrieved_uris = []
+        context_blocks = []
+
+        for r in search_res.resources:
+            retrieved_uris.append(r.uri)
+            content = self.db.read_resource(r.uri)
+            retrieved_texts.append(content)
+            context_blocks.append(content[:2000])
+
+        recall = MetricsCalculator.check_recall(retrieved_texts, qa.evidence)
+
+        # ---------- Prompt ----------
+        full_prompt, meta = self.adapter.build_prompt(qa, context_blocks)
+
+        # ---------- Generation ----------
+        ans_raw = self.llm.generate(full_prompt)
+        generation_usage = getattr(self.llm, "last_usage", {})
+
+        ans = self.adapter.post_process_answer(qa, ans_raw, meta)
+
+        # ---------- Token stats ----------
+        in_tokens = self.db.count_tokens(full_prompt) + self.db.count_tokens(qa.question)
+        out_tokens = self.db.count_tokens(ans)
+
+        self.monitor.worker_end(tokens=in_tokens + out_tokens)
+
+        return {
+            "_global_index": task['id'],
+            "sample_id": task['sample_id'],
+            "question": qa.question,
+            "gold_answers": qa.gold_answers,
+            "category": str(qa.category),
+            "evidence": qa.evidence,
+            "retrieval": {
+                "latency_sec": latency,
+                "uris": retrieved_uris
+            },
+            "llm": {"final_answer": ans},
+            "metrics": {"Recall": recall},
+            "token_usage": {
+                # ruc 口径
+                "total_input_tokens": int(in_tokens),
+                "llm_output_tokens": int(out_tokens),
+
+                # generation 真实 usage
+                "generation_usage": generation_usage,
+
+                # HippoRAG2 内部
+                "hippo_internal_input_tokens": hippo_internal_in,
+                "hippo_internal_output_tokens": hippo_internal_out,
+                "hippo_internal_detail": hippo_delta,
+            }
+        }
+
+    # =========================================================
+    # ====================== EVALUATION =======================
+    # =========================================================
     def run_evaluation(self):
-        """Step 4: 结果评测打分"""
-        self.logger.info(">>> Stage: Evaluation")
+        from concurrent.futures import TimeoutError  # ✅ 记得导入
 
         if not os.path.exists(self.generated_file):
-            self.logger.error("Generated answers file not found.")
+            self.logger.error(f"Generated answers file not found: {self.generated_file}")
             return
 
         with open(self.generated_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            items = data.get("results", [])
+            items = json.load(f)["results"]
 
-        eval_items = items
-        eval_results_map = {}
-        
-        with ThreadPoolExecutor(max_workers=self.config['execution']['max_workers']) as executor:
-            future_to_item = {
-                executor.submit(self._process_evaluation_task, item): item 
-                for item in eval_items
+        # ✅ 让 max_queries 对 eval 生效：必须在 submit 之前截断
+        max_q = self.config.get("execution", {}).get("max_queries")
+        if max_q is not None:
+            try:
+                max_q = int(max_q)
+                items = items[:max_q]
+            except Exception:
+                self.logger.warning(f"Invalid max_queries={max_q}, ignore slicing.")
+
+        self.logger.info(f"Stage: Evaluation (items={len(items)})")
+
+        timeout_s = self.config.get("execution", {}).get("eval_task_timeout", 120)
+
+        results = {}
+        partial_file = self.eval_file.replace(".json", ".partial.json")
+
+        with ThreadPoolExecutor(max_workers=self.config["execution"]["max_workers"]) as executor:
+            future_map = {
+                executor.submit(self._process_evaluation_task, item): item
+                for item in items
             }
-            
-            pbar = tqdm(total=len(eval_items), desc="Evaluating", unit="item")
-            for future in as_completed(future_to_item):
+
+            pbar = tqdm(total=len(future_map), desc="Evaluating", unit="item")
+
+            for future in as_completed(future_map):
+                item = future_map[future]
                 try:
-                    res = future.result()
-                    eval_results_map[res['_global_index']] = res
+                    res = future.result(timeout=timeout_s)
+                except TimeoutError:
+                    self.logger.error(
+                        f"[EVAL TIMEOUT] sample_id={item.get('sample_id')} "
+                        f"q={str(item.get('question',''))[:80]}"
+                    )
+                    # 兜底：判错 + 写回
+                    item.setdefault("metrics", {})
+                    item["metrics"].update({
+                        "F1": item.get("metrics", {}).get("F1", 0.0),
+                        "Accuracy": 0.0,
+                        "judge_usage": {"error": "timeout"}
+                    })
+                    res = item
                 except Exception as e:
-                    self.logger.error(f"Evaluation failed: {e}")
+                    self.logger.error(
+                        f"[EVAL ERROR] sample_id={item.get('sample_id')} err={e}"
+                    )
+                    item.setdefault("metrics", {})
+                    item["metrics"].update({
+                        "F1": item.get("metrics", {}).get("F1", 0.0),
+                        "Accuracy": 0.0,
+                        "judge_usage": {"error": str(e)}
+                    })
+                    res = item
+
+                results[res["_global_index"]] = res
                 pbar.update(1)
+
+                # ✅ 边跑边写 partial，方便你立刻看到初步输出
+                try:
+                    eval_records_partial = [results[k] for k in sorted(results.keys())]
+                    with open(partial_file, "w", encoding="utf-8") as pf:
+                        json.dump({"results": eval_records_partial}, pf, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    self.logger.warning(f"Failed to write partial eval file: {e}")
+
             pbar.close()
 
-        # 保存详细评测文件 & 将评测指标写入报告
-        eval_records = list(eval_results_map.values())
-        total = len(eval_records)
+        eval_records = [results[k] for k in sorted(results.keys())]
 
         with open(self.eval_file, "w", encoding="utf-8") as f:
             json.dump({"results": eval_records}, f, indent=2, ensure_ascii=False)
 
-        if total > 0:
-            self._update_report({
-                "Dataset": self.config.get('dataset_name', 'Unknown_Dataset'),
-                "Total Queries Evaluated": total,
-                "Performance Metrics": {
-                    "Average F1 Score": sum(r['metrics']['F1'] for r in eval_records) / total,
-                    "Average Recall": sum(r['metrics']['Recall'] for r in eval_records) / total,
-                    "Average Accuracy (Hit Rate)": sum(r['metrics']['Accuracy'] for r in eval_records) / total,
-                }
-            })
+        self.logger.info(f"Eval results saved -> {self.eval_file}")
+        self.logger.info(f"Partial results saved -> {partial_file}")
 
-    def run_deletion(self):
-        """Step 5: 数据清理"""
-        self.logger.info(">>> Stage: Deletion")
-        start_time = time.time()
-        self.db.clear()
-        duration = time.time() - start_time
-        self.metrics_summary["deletion"] = {"time": duration, "input_tokens": 0, "output_tokens": 0}
-        self.logger.info(f"Deletion finished. Time: {duration:.2f}s")
-
-        # 将 deletion 效率数据写入报告
         self._update_report({
-            "Deletion Efficiency (Total Dataset)": {
-                "Total Deletion Time (s)": duration,
-                "Total Input Tokens": 0,
-                "Total Output Tokens": 0
-            }
+            "Judge Efficiency (Total)": self.metrics_summary["judge"]
         })
+
+    def _process_evaluation_task(self, item):
+        ans = item["llm"]["final_answer"]
+        golds = item["gold_answers"]
+
+        f1 = max((MetricsCalculator.calculate_f1(ans, g) for g in golds), default=0.0)
+
+        dataset_name = self.config.get('dataset_name')
+
+        t0 = time.time()
+
+        ok = llm_grader(
+            self.llm,
+            self.config['llm']['model'],
+            item["question"],
+            "\n".join(golds),
+            ans,
+            dataset_name=dataset_name
+        )
+
+        dt = time.time() - t0
+
+        # judge 使用 LLMClientWrapper.last_usage 精确记录
+        judge_usage = getattr(self.llm, "last_usage", {})
+
+        self.metrics_summary["judge"]["time"] += dt
+        self.metrics_summary["judge"]["input_tokens"] += judge_usage.get("cl100k_prompt_tokens", 0)
+        self.metrics_summary["judge"]["output_tokens"] += judge_usage.get("cl100k_completion_tokens", 0)
+
+        item["metrics"].update({
+            "F1": f1,
+            "Accuracy": 1.0 if ok else 0.0,
+            "judge_usage": judge_usage
+        })
+
+        return item
+
+    # =========================================================
 
     def _prepare_tasks(self, samples):
         tasks = []
-        global_idx = 0
+        idx = 0
         max_queries = self.config['execution'].get('max_queries')
+
         for sample in samples:
             for qa in sample.qa_pairs:
-                if max_queries is not None and global_idx >= max_queries:
+                if max_queries is not None and idx >= max_queries:
                     break
-                tasks.append({"id": global_idx, "sample_id": sample.sample_id, "qa": qa})
-                global_idx += 1
-            if max_queries is not None and global_idx >= max_queries:
-                break
+                tasks.append({
+                    "id": idx,
+                    "sample_id": sample.sample_id,
+                    "qa": qa
+                })
+                idx += 1
         return tasks
 
-    def _process_generation_task(self, task):
-        self.monitor.worker_start()
-        try:
-            qa = task['qa']
-            
-            # 1. Retrieval
-            t0 = time.time()
-            search_res = self.db.retrieve(query=qa.question, topk=self.config['execution']['retrieval_topk'])
-            latency = time.time() - t0
-            
-            retrieved_texts = []
-            retrieved_uris = []
-            context_blocks = []
-            for r in search_res.resources:
-                retrieved_uris.append(r.uri)
-                content = self.db.read_resource(r.uri) if getattr(r, 'is_leaf', False) else f"{getattr(r, 'abstract', '')}\n{getattr(r, 'overview', '')}"
-                retrieved_texts.append(content)
-                import re
-                # clean = re.sub(r' \[.*?\]', '', content)[:2000]
-                clean = content[:2000]
-                context_blocks.append(clean)
-
-            recall = MetricsCalculator.check_recall(retrieved_texts, qa.evidence)
-            
-            # 2. Prompting logic (调用 Adapter 动态生成)
-            full_prompt, meta = self.adapter.build_prompt(qa, context_blocks)
-            
-            # 3. Generation
-            ans_raw = self.llm.generate(full_prompt)
-
-            # 4. Post-processing (调用 Adapter 动态解析)
-            ans = self.adapter.post_process_answer(qa, ans_raw, meta)
-
-            # 5. Token stats
-            in_tokens = self.db.count_tokens(full_prompt) + self.db.count_tokens(qa.question)
-            out_tokens = self.db.count_tokens(ans)
-            self.monitor.worker_end(tokens=in_tokens + out_tokens)
-            
-            self.logger.info(f"[Query-{task['id']}] Q: {qa.question[:30]}... | Recall: {recall:.2f} | Latency: {latency:.2f}s")
-
-            return {
-                "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
-                "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
-                "retrieval": {"latency_sec": latency, "uris": retrieved_uris},
-                "llm": {"final_answer": ans},
-                "metrics": {"Recall": recall}, "token_usage": {"total_input_tokens": in_tokens, "llm_output_tokens": out_tokens}
-            }
-        except Exception as e:
-            self.monitor.worker_end(success=False)
-            raise e
-
-    def _process_evaluation_task(self, item):
-        ans, golds = item['llm']['final_answer'], item['gold_answers']
-        f1 = max((MetricsCalculator.calculate_f1(ans, gt) for gt in golds), default=0.0)
-        
-        dataset_name = self.config.get('dataset_name', 'Unknown_Dataset')
-        
-        # Accuracy via LLM Judge (使用通用 llm_grader 接口)
-        try:
-            acc = 1.0 if llm_grader(
-                self.llm.llm, 
-                self.config['llm']['model'], 
-                item['question'], 
-                "\n".join(golds), 
-                ans,
-                dataset_name=dataset_name
-            ) else 0.0
-        except Exception as e:
-            self.logger.error(f"Grader error: {e}")
-            acc = 0.0
-
-        if MetricsCalculator.check_refusal(ans) and any(MetricsCalculator.check_refusal(gt) for gt in golds):
-            f1, acc = 1.0, 1.0
-
-        item["metrics"].update({"F1": f1, "Accuracy": acc})
-        detailed_info = (
-            f"\n" + "="*60 +
-            f"\n[Query ID]: {item['_global_index']}"
-            f"\n[Question]: {item['question']}"
-            f"\n[Retrieved URIs]: {item['retrieval'].get('uris', [])}"
-            f"\n[LLM Answer]: {ans}"
-            f"\n[Gold Answer]: {golds}"
-            f"\n[Metrics]: {item['metrics']}"
-            f"\n" + "="*60
-        )
-        self.logger.info(detailed_info)
-        return item
-
     def _update_report(self, data):
-        """读取已有报告，合并新数据后写回"""
         report = {}
         if os.path.exists(self.report_file):
             with open(self.report_file, "r", encoding="utf-8") as f:
                 try:
                     report = json.load(f)
-                except json.JSONDecodeError:
+                except:
                     report = {}
+
         report.update(data)
+
         with open(self.report_file, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=4, ensure_ascii=False)
+
         self.logger.info(f"Report updated -> {self.report_file}")
